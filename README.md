@@ -30,6 +30,12 @@ bars and lets you drag them.
 - **Summer and Away mode built in.** Two switches in the card header, no extra
   setup: press **Modi einrichten** once and the card creates the helpers and
   attaches them to every schedule as a condition.
+- **Window monitoring per room.** **Fenster (n)** opens a panel where you assign
+  door/window sensors to the room; sensors sitting in the same HA area are
+  offered first. Assigned windows that are currently open are highlighted, so
+  you can see at a glance why a room is not heating.
+- **Start from nothing.** No schedules yet? Pick a thermostat under
+  **Raum hinzufügen** and the card lays down a Mo–Fr and a Sa–So plan to edit.
 - **Now marker** on whichever row applies today.
 - **Nothing is written until you press Save.** Until then the card shows an
   "Ungespeichert" badge and a Discard button.
@@ -53,6 +59,25 @@ One consequence worth knowing: the immediate switch-off is issued by the card.
 If you flip the helper somewhere else — a dashboard toggle, a voice command —
 running heat keeps running until the next slot boundary. Add a small automation
 if you need that covered.
+
+### How window monitoring behaves
+
+Assigning a window to a room adds it to that room's schedules as an "is off"
+condition. That covers one half of the job: **while a window is open, no
+schedule starts heating**, and when it closes, Scheduler re-applies the block
+that should be running — within a couple of seconds, no waiting for the next
+slot.
+
+It does not cover the other half. Conditions are checked when a slot fires;
+they never interrupt heat that is already running. For that, switch on
+**"Laufende Heizung sofort abschalten"**. The card then writes a small
+automation through Home Assistant's config API — one per room, named
+`<room>: Heizung aus bei offenem Fenster` — and keeps its trigger list in step
+with the window list. Switching it off deletes the automation again. Nothing
+else in your automation list is touched.
+
+Both halves are optional and independent: use the condition alone if you only
+want to stop schedules from firing into an open window.
 
 ## Requirements
 
@@ -135,9 +160,12 @@ what makes the timeline unambiguous.
 
 ## Known limitations
 
-- The card edits **times, temperatures and weekdays**. Conditions beyond the two modes and
-  repeat behaviour are still set in `scheduler-card` or via
-  `scheduler.add` / `scheduler.edit`.
+- The card edits **times, temperatures, weekdays and window sensors**. Other
+  condition types and the repeat behaviour are still set in `scheduler-card` or
+  via `scheduler.add` / `scheduler.edit` — the card carries them through
+  untouched.
+- Window sensors are matched by `device_class`: `window`, `door`, `opening` or
+  `garage_door`. A sensor without one of those will not be offered.
 - Sun-relative times (`sunrise+01:00`) are not represented on the timeline yet;
   such a schedule renders from its resolved clock time.
 

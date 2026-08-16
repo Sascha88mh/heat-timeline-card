@@ -7,7 +7,7 @@
  * so entity names and user config can never inject markup.
  */
 
-const VERSION = "0.2.0";
+const VERSION = "0.3.0";
 const DAY = 1440;
 
 /* ------------------------------------------------------------------ utils */
@@ -164,15 +164,38 @@ function withModeConditions(conditions, modes) {
   return out;
 }
 
+/** Window/door sensors act as conditions; the mode helpers are not windows. */
+const isWindowCond = (c) =>
+  String(c.entity_id || "").slice(0, "binary_sensor.".length) === "binary_sensor.";
+
+/** Window sensors currently guarding a schedule. */
+function windowsOf(item) {
+  const first = (item.timeslots || [])[0] || {};
+  return (first.conditions || []).filter(isWindowCond).map((c) => c.entity_id);
+}
+
+/** Replace the window part of a condition list, keeping everything else. */
+function setWindows(conditions, sensors) {
+  const kept = cleanConditions(conditions).filter((c) => !isWindowCond(c));
+  return kept.concat(
+    sensors.map((e) => ({ entity_id: e, value: "off", match_type: "is" }))
+  );
+}
+
+const WINDOW_CLASSES = ["window", "door", "opening", "garage_door"];
+
 /**
  * Heat blocks -> full-day timeslots, re-using the conditions and action shape
  * of the existing schedule so nothing is silently dropped on save.
  */
-function toTimeslots(item, blocks, modes) {
+function toTimeslots(item, blocks, modes, conditions) {
   const first = (item.timeslots || [])[0] || {};
   const entity = scheduleEntity(item);
   const base = {
-    conditions: withModeConditions(first.conditions, modes || {}),
+    conditions: withModeConditions(
+      conditions === undefined ? first.conditions : conditions,
+      modes || {}
+    ),
     condition_type: first.condition_type || "and",
     track_conditions:
       first.track_conditions === undefined ? true : first.track_conditions,
@@ -252,9 +275,11 @@ class HeatTimelineCard extends HTMLElement {
     this._items = [];   // schedules straight from the scheduler websocket api
     this._draft = {};   // schedule_id -> blocks being edited
     this._days = {};    // schedule_id -> weekdays being edited
+    this._conds = {};   // schedule_id -> conditions being edited
     this._dirty = {};   // schedule_id -> true
     this._edit = null;  // {id, index} of the open block editor
     this._open = {};    // schedule_id -> day/settings strip expanded
+    this._panel = {};   // climate entity -> "windows" panel expanded
     this._loaded = false;
     this._drag = null;
     this._tick = null;
@@ -343,6 +368,7 @@ class HeatTimelineCard extends HTMLElement {
       });
       this._draft = {};
       this._days = {};
+      this._conds = {};
       this._render();
     } catch (e) {
       /* keep showing the previous data */
@@ -359,6 +385,167 @@ class HeatTimelineCard extends HTMLElement {
     if (!this._days[item.schedule_id])
       this._days[item.schedule_id] = expandDays(item.weekdays);
     return this._days[item.schedule_id];
+  }
+
+  _conditions(item) {
+    if (!this._conds[item.schedule_id])
+      this._conds[item.schedule_id] = cleanConditions(
+        ((item.timeslots || [])[0] || {}).conditions
+      );
+    return this._conds[item.schedule_id];
+  }
+
+  /* ---------------------------------------------------------- windows */
+
+  /** Window sensors guarding a room (union over its schedules). */
+  _windows(room) {
+    const set = new Set();
+    for (const s of room.schedules)
+      for (const c of this._conditions(s)) if (isWindowCond(c)) set.add(c.entity_id);
+    return [...set];
+  }
+
+  /** Assign the window list to every schedule of the room. */
+  _setRoomWindows(room, sensors) {
+    for (const s of room.schedules) {
+      this._conds[s.schedule_id] = setWindows(this._conditions(s), sensors);
+      this._dirty[s.schedule_id] = true;
+    }
+    this._render();
+  }
+
+  _areaOf(entityId) {
+    const hass = this._hass;
+    const ent = hass.entities && hass.entities[entityId];
+    if (!ent) return null;
+    if (ent.area_id) return ent.area_id;
+    const dev = ent.device_id && hass.devices && hass.devices[ent.device_id];
+    return dev ? dev.area_id || null : null;
+  }
+
+  _areaName(areaId) {
+    const a = areaId && this._hass.areas && this._hass.areas[areaId];
+    return a ? a.name : null;
+  }
+
+  /** Openable sensors, the ones sharing the room's area first. */
+  _windowCandidates(room) {
+    const taken = new Set(this._windows(room));
+    const roomArea = this._areaOf(room.entity);
+    const out = [];
+    for (const id of Object.keys(this._hass.states)) {
+      if (id.slice(0, 14) !== "binary_sensor.") continue;
+      if (taken.has(id)) continue;
+      const st = this._hass.states[id];
+      if (WINDOW_CLASSES.indexOf(st.attributes.device_class) === -1) continue;
+      const area = this._areaOf(id);
+      out.push({
+        id,
+        name: st.attributes.friendly_name || id,
+        area: this._areaName(area),
+        same: !!roomArea && area === roomArea,
+      });
+    }
+    out.sort(
+      (a, b) => (b.same ? 1 : 0) - (a.same ? 1 : 0) || a.name.localeCompare(b.name)
+    );
+    return out;
+  }
+
+  /* ------------------------------------- "switch off when opened" rule */
+
+  _ruleId(room) {
+    return "heat_timeline_" + room.entity.replace(/[^a-z0-9]+/gi, "_");
+  }
+
+  _ruleEntity(room) {
+    const id = this._ruleId(room);
+    for (const eid of Object.keys(this._hass.states)) {
+      if (eid.slice(0, 11) !== "automation.") continue;
+      if (this._hass.states[eid].attributes.id === id) return eid;
+    }
+    return null;
+  }
+
+  /**
+   * Scheduler conditions keep a room from *starting* to heat, but they never
+   * stop heat that is already running. That needs an automation, which the
+   * frontend can write through the config API.
+   */
+  async _toggleRule(room) {
+    if (this._busy) return;
+    this._busy = true;
+    this._render();
+    const id = this._ruleId(room);
+    const existing = this._ruleEntity(room);
+    const sensors = this._windows(room);
+    try {
+      if (existing) {
+        await this._hass.callApi("delete", "config/automation/config/" + id);
+      } else if (sensors.length) {
+        const st = this._hass.states[room.entity];
+        const name =
+          (st && st.attributes.friendly_name) || room.entity.split(".")[1];
+        await this._hass.callApi("post", "config/automation/config/" + id, {
+          id: id,
+          alias: name + ": Heizung aus bei offenem Fenster",
+          description: "Angelegt von der Heat Timeline Card.",
+          triggers: [
+            { trigger: "state", entity_id: sensors, from: "off", to: "on" },
+          ],
+          conditions: [],
+          actions: [
+            {
+              action: "climate.set_hvac_mode",
+              target: { entity_id: room.entity },
+              data: { hvac_mode: "off" },
+            },
+          ],
+          mode: "single",
+        });
+      }
+      await this._hass.callService("automation", "reload", {});
+    } catch (e) {
+      this._error = "Die Regel konnte nicht gespeichert werden: " + e.message;
+    }
+    this._busy = false;
+    this._render();
+  }
+
+  /** Keep an existing rule's trigger list in step with the window list. */
+  async _syncRule(room) {
+    const existing = this._ruleEntity(room);
+    if (!existing) return;
+    const sensors = this._windows(room);
+    const id = this._ruleId(room);
+    const st = this._hass.states[room.entity];
+    const name = (st && st.attributes.friendly_name) || room.entity.split(".")[1];
+    try {
+      if (!sensors.length) {
+        await this._hass.callApi("delete", "config/automation/config/" + id);
+      } else {
+        await this._hass.callApi("post", "config/automation/config/" + id, {
+          id: id,
+          alias: name + ": Heizung aus bei offenem Fenster",
+          description: "Angelegt von der Heat Timeline Card.",
+          triggers: [
+            { trigger: "state", entity_id: sensors, from: "off", to: "on" },
+          ],
+          conditions: [],
+          actions: [
+            {
+              action: "climate.set_hvac_mode",
+              target: { entity_id: room.entity },
+              data: { hvac_mode: "off" },
+            },
+          ],
+          mode: "single",
+        });
+      }
+      await this._hass.callService("automation", "reload", {});
+    } catch (e) {
+      /* the schedules were saved; the rule stays as it was */
+    }
   }
 
   _itemById(id) {
@@ -457,7 +644,9 @@ class HeatTimelineCard extends HTMLElement {
       entity_id: item.entity_id,
       weekdays: days.length ? days : ["daily"],
       repeat_type: item.repeat_type || "repeat",
-      timeslots: toTimeslots(item, blocks, this._config.modes),
+      timeslots: toTimeslots(
+        item, blocks, this._config.modes, this._conditions(item)
+      ),
     };
     if (item.name) data.name = item.name;
     try {
@@ -473,6 +662,7 @@ class HeatTimelineCard extends HTMLElement {
   _revert(item) {
     delete this._draft[item.schedule_id];
     delete this._days[item.schedule_id];
+    delete this._conds[item.schedule_id];
     delete this._dirty[item.schedule_id];
     this._edit = null;
     this._render();
@@ -583,11 +773,12 @@ class HeatTimelineCard extends HTMLElement {
           h("div", {
             class: "pad muted",
             text:
-              "Keine Heiz-Zeitpläne gefunden. Lege im Scheduler einen Zeitplan " +
-              "für ein climate-Gerät an.",
+              "Noch kein Heizplan vorhanden. Wähle unten ein Thermostat aus — " +
+              "alles Weitere stellst du danach hier ein.",
           })
         );
       else for (const r of rooms) kids.push(this._room(r));
+      kids.push(h("div", { class: "room addroom" }, this._addRoomPanel()));
     }
     this._card.replaceChildren(...kids);
   }
@@ -693,6 +884,14 @@ class HeatTimelineCard extends HTMLElement {
         : null,
       h("span", { class: "grow" }),
       h("button", {
+        class: "btn ghost sm" + (this._panel[room.entity] ? " on" : ""),
+        text: "Fenster (" + this._windows(room).length + ")",
+        onclick: () => {
+          this._panel[room.entity] = !this._panel[room.entity];
+          this._render();
+        },
+      }),
+      h("button", {
         class: "btn ghost sm",
         text: "+ Zeitplan",
         disabled: this._busy ? "true" : null,
@@ -712,11 +911,12 @@ class HeatTimelineCard extends HTMLElement {
         ? h("button", {
             class: "btn primary sm",
             text: "Speichern",
-            onclick: () => {
+            onclick: async () => {
               this._edit = null;
-              room.schedules.forEach(
-                (s) => this._dirty[s.schedule_id] && this._save(s)
-              );
+              for (const s of room.schedules)
+                if (this._dirty[s.schedule_id]) await this._save(s);
+              // an existing "switch off when opened" rule follows the window list
+              await this._syncRule(room);
             },
           })
         : null
@@ -728,8 +928,180 @@ class HeatTimelineCard extends HTMLElement {
       head,
       room.schedules.map((s) => this._row(s)),
       scale,
-      foot
+      foot,
+      this._panel[room.entity] ? this._windowPanel(room) : null
     );
+  }
+
+  /** Assign window sensors to a room and decide what an open window does. */
+  _windowPanel(room) {
+    const sensors = this._windows(room);
+    const cand = this._windowCandidates(room);
+    const ruleOn = !!this._ruleEntity(room);
+
+    const chips = sensors.length
+      ? sensors.map((id) => {
+          const st = this._hass.states[id];
+          const open = st && st.state === "on";
+          return h(
+            "span",
+            { class: "wchip" + (open ? " open" : "") },
+            h("span", { text: (st && st.attributes.friendly_name) || id }),
+            h("button", {
+              class: "x",
+              text: "✕",
+              title: "Entfernen",
+              onclick: () => {
+                this._setRoomWindows(room, sensors.filter((s) => s !== id));
+              },
+            })
+          );
+        })
+      : [h("span", { class: "muted sm", text: "Noch kein Fenster zugeordnet." })];
+
+    const picker = h(
+      "select",
+      { class: "picker" },
+      h("option", { value: "", text: cand.length ? "Fenster wählen…" : "Keine weiteren Sensoren" }),
+      cand.map((c) =>
+        h("option", {
+          value: c.id,
+          text: c.name + (c.area ? " · " + c.area : "") + (c.same ? "  ✓" : ""),
+        })
+      )
+    );
+
+    return h(
+      "div",
+      { class: "wpanel" },
+      h("div", { class: "wtitle", text: "Fenster in diesem Raum" }),
+      h("div", { class: "wchips" }, chips),
+      h(
+        "div",
+        { class: "wrow" },
+        picker,
+        h("button", {
+          class: "btn ghost sm",
+          text: "Hinzufügen",
+          disabled: cand.length ? null : "true",
+          onclick: () => {
+            if (!picker.value) return;
+            this._setRoomWindows(room, sensors.concat([picker.value]));
+          },
+        })
+      ),
+      h("div", {
+        class: "muted sm",
+        text:
+          "Solange eines dieser Fenster offen ist, startet kein Zeitplan die " +
+          "Heizung. Schließt es wieder, heizt der laufende Block sofort weiter.",
+      }),
+      h(
+        "div",
+        { class: "wrow" },
+        h("button", {
+          class: "toggle" + (ruleOn ? " on" : ""),
+          text: ruleOn ? "Ein" : "Aus",
+          disabled: this._busy || !sensors.length ? "true" : null,
+          onclick: () => this._toggleRule(room),
+        }),
+        h("span", {
+          class: "sm",
+          text: "Laufende Heizung sofort abschalten, wenn ein Fenster geöffnet wird",
+        })
+      ),
+      ruleOn
+        ? h("div", {
+            class: "muted sm",
+            text: "Dafür liegt eine Automation in Home Assistant, die diese Karte verwaltet.",
+          })
+        : null
+    );
+  }
+
+  /** First-run path: pick a thermostat and get a working week straight away. */
+  _addRoomPanel() {
+    const used = new Set(this._rooms().map((r) => r.entity));
+    const cand = Object.keys(this._hass.states)
+      .filter((id) => id.slice(0, 8) === "climate." && !used.has(id))
+      .map((id) => ({
+        id,
+        name: this._hass.states[id].attributes.friendly_name || id,
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+
+    const picker = h(
+      "select",
+      { class: "picker" },
+      h("option", { value: "", text: cand.length ? "Thermostat wählen…" : "Kein weiteres Thermostat" }),
+      cand.map((c) => h("option", { value: c.id, text: c.name }))
+    );
+
+    return h(
+      "div",
+      { class: "wpanel" },
+      h("div", { class: "wtitle", text: "Raum hinzufügen" }),
+      h(
+        "div",
+        { class: "wrow" },
+        picker,
+        h("button", {
+          class: "btn primary sm",
+          text: "Anlegen",
+          disabled: this._busy || !cand.length ? "true" : null,
+          onclick: () => picker.value && this._addRoom(picker.value),
+        })
+      ),
+      h("div", {
+        class: "muted sm",
+        text:
+          "Legt zwei Zeitpläne an — Mo–Fr und Sa–So, jeweils 06:00–22:00 bei 20 °. " +
+          "Zeiten, Tage und Fenster stellst du danach direkt hier ein.",
+      })
+    );
+  }
+
+  async _addRoom(entity) {
+    if (this._busy) return;
+    this._busy = true;
+    this._render();
+    const st = this._hass.states[entity];
+    const name = (st && st.attributes.friendly_name) || entity.split(".")[1];
+    const conditions = withModeConditions([], this._config.modes);
+    const base = { conditions, condition_type: "and", track_conditions: true };
+    const mk = (start, stop, temp) =>
+      Object.assign({ start: toTime(start), stop: toTime(stop) }, base, {
+        actions: [
+          temp === null
+            ? {
+                entity_id: entity,
+                service: "climate.set_hvac_mode",
+                service_data: { hvac_mode: "off" },
+              }
+            : {
+                entity_id: entity,
+                service: "climate.set_temperature",
+                service_data: { temperature: temp, hvac_mode: "heat" },
+              },
+        ],
+      });
+    const slots = [mk(0, 360, null), mk(360, 1320, 20), mk(1320, DAY, null)];
+    try {
+      for (const [label, days] of [
+        ["Mo–Fr", ["mon", "tue", "wed", "thu", "fri"]],
+        ["Sa–So", ["sat", "sun"]],
+      ])
+        await this._hass.callService("scheduler", "add", {
+          name: name + " " + label,
+          weekdays: days,
+          repeat_type: "repeat",
+          timeslots: slots,
+        });
+    } catch (e) {
+      this._error = "Der Raum konnte nicht angelegt werden: " + e.message;
+    }
+    this._busy = false;
+    await this._reload();
   }
 
   _row(item) {
@@ -1132,7 +1504,34 @@ ha-card { overflow:hidden; }
 .btn.ghost { background:rgba(128,128,128,.18); color:var(--primary-text-color); }
 .btn.primary { background:#F4711C; color:#fff; }
 .btn.danger { color:var(--error-color,#db4437); }
+.btn.on { background:rgba(244,113,28,.20); color:#F4711C; }
 .btn[disabled] { opacity:.5; cursor:default; }
+
+.sm { font-size:11.5px; color:var(--primary-text-color); }
+.muted.sm { color:var(--secondary-text-color); line-height:1.45; }
+.wpanel { margin-top:10px; padding:12px; border-radius:12px;
+          background:rgba(128,128,128,.12); display:flex; flex-direction:column; gap:9px; }
+.wtitle { font-size:12px; font-weight:700; color:var(--primary-text-color);
+          letter-spacing:.2px; }
+.wchips { display:flex; flex-wrap:wrap; gap:6px; align-items:center; }
+.wchip { display:inline-flex; align-items:center; gap:6px; border-radius:999px;
+         padding:4px 6px 4px 11px; font-size:11.5px; font-weight:600;
+         background:rgba(128,128,128,.22); color:var(--primary-text-color); }
+.wchip.open { background:rgba(94,190,255,.18); color:#5EBEFF; }
+.wchip .x { border:none; background:none; cursor:pointer; font-size:11px;
+            line-height:1; padding:2px 4px; color:inherit; opacity:.7; }
+.wchip .x:hover { opacity:1; }
+.wrow { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.picker { flex:1; min-width:150px; border-radius:8px; padding:7px 9px;
+          font-size:12.5px; border:1px solid var(--divider-color,rgba(128,128,128,.3));
+          background:var(--card-background-color,transparent);
+          color:var(--primary-text-color); }
+.toggle { border:none; cursor:pointer; border-radius:999px; padding:5px 14px;
+          font-size:11.5px; font-weight:700; min-width:52px;
+          background:rgba(128,128,128,.22); color:var(--secondary-text-color); }
+.toggle.on { background:rgba(244,113,28,.20); color:#F4711C; }
+.toggle[disabled] { opacity:.5; cursor:default; }
+.addroom { padding-top:14px; }
 `;
 
 /* ------------------------------------------------------------- register */
@@ -1161,4 +1560,5 @@ console.info(
 export {
   HeatTimelineCard, toBlocks, toTimeslots, normalise, daysLabel, coversToday,
   expandDays, daySortKey, gapAround, withModeConditions,
+  windowsOf, setWindows, isWindowCond,
 };
