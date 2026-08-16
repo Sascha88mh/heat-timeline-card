@@ -7,7 +7,7 @@
  * so entity names and user config can never inject markup.
  */
 
-const VERSION = "0.5.0";
+const VERSION = "0.5.1";
 const DAY = 1440;
 
 /* ------------------------------------------------------------------ utils */
@@ -283,6 +283,7 @@ class HeatTimelineCard extends HTMLElement {
     this._gear = {};    // climate entity -> settings panel expanded
     this._target = {};  // schedule_id -> climate entity being reassigned
     this._pick = {};    // picker key -> selected value, kept across renders
+    this._nameDraft = {}; // climate entity -> name being typed
     this._sig = "";
     this._loaded = false;
     this._drag = null;
@@ -351,7 +352,9 @@ class HeatTimelineCard extends HTMLElement {
               "/" +
               st.attributes.current_temperature +
               "/" +
-              st.attributes.temperature
+              st.attributes.temperature +
+              "/" +
+              st.attributes.friendly_name
             : "-")
       );
     };
@@ -680,18 +683,29 @@ class HeatTimelineCard extends HTMLElement {
     return (st && st.attributes.friendly_name) || String(entity).split(".")[1];
   }
 
-  /** Renaming the thermostat is how a room gets its name. */
-  async _rename(room, name) {
-    const next = String(name || "").trim();
-    if (!next || next === this._roomName(room.entity)) return;
+  /**
+   * Renaming the thermostat is how a room gets its name.
+   *
+   * The typed text lives in component state, because a redraw would otherwise
+   * rebuild the input from the entity and snap it back to the old name before
+   * the registry has even answered.
+   */
+  async _rename(room) {
+    const key = room.entity;
+    const next = String(this._nameDraft[key] || "").trim();
+    if (!next || next === this._roomName(key)) {
+      delete this._nameDraft[key];
+      this._render();
+      return;
+    }
     this._busy = true;
-    this._render();
     try {
       await this._hass.connection.sendMessagePromise({
         type: "config/entity_registry/update",
-        entity_id: room.entity,
+        entity_id: key,
         name: next,
       });
+      delete this._nameDraft[key];
     } catch (e) {
       this._error = "Umbenennen fehlgeschlagen: " + e.message;
     }
@@ -1102,11 +1116,21 @@ class HeatTimelineCard extends HTMLElement {
       "Thermostat wählen…"
     );
 
+    const key = room.entity;
+    const pending = this._nameDraft[key] !== undefined;
     const nameInput = h("input", {
       class: "text",
       type: "text",
-      value: this._roomName(room.entity),
+      value: pending ? this._nameDraft[key] : this._roomName(key),
       placeholder: "Name des Raums",
+      oninput: (e) => {
+        this._nameDraft[key] = e.target.value;
+        const btn = this._card.querySelector('.save-name[data-room="' + key + '"]');
+        if (btn) btn.disabled = !String(e.target.value).trim();
+      },
+      onkeydown: (e) => {
+        if (e.key === "Enter") this._rename(room);
+      },
     });
 
     const rooms = this._rooms().map((r) => r.entity);
@@ -1121,12 +1145,16 @@ class HeatTimelineCard extends HTMLElement {
         "div",
         { class: "wrow" },
         nameInput,
-        h("button", {
-          class: "btn ghost sm",
-          text: "Umbenennen",
-          disabled: this._busy ? "true" : null,
-          onclick: () => this._rename(room, nameInput.value),
-        }),
+        (() => {
+          const b = h("button", {
+            class: "btn primary sm save-name",
+            "data-room": key,
+            text: "Speichern",
+            onclick: () => this._rename(room),
+          });
+          b.disabled = this._busy || !String(nameInput.value).trim();
+          return b;
+        })(),
         h("button", {
           class: "arrow",
           text: "↑",
@@ -1145,8 +1173,8 @@ class HeatTimelineCard extends HTMLElement {
       h("div", {
         class: "muted sm",
         text:
-          "Der Name ist der des Thermostats und gilt in ganz Home Assistant. " +
-          "Mit den Pfeilen sortierst du die Räume in dieser Karte.",
+          "Wird sofort übernommen. Der Name ist der des Thermostats und gilt " +
+          "in ganz Home Assistant. Mit den Pfeilen sortierst du die Räume hier.",
       }),
 
       h("div", { class: "wtitle", text: "Fenster in diesem Raum" }),
