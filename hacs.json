@@ -1,0 +1,6 @@
+{
+  "name": "Heat Timeline Card",
+  "render_readme": true,
+  "filename": "heat-timeline-card.js",
+  "homeassistant": "2024.1.0"
+}
