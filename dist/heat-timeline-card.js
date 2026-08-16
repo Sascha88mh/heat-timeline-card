@@ -7,7 +7,7 @@
  * so entity names and user config can never inject markup.
  */
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 const DAY = 1440;
 
 /* ------------------------------------------------------------------ utils */
@@ -66,17 +66,26 @@ const WEEK_LABEL = {
   mon: "Mo", tue: "Di", wed: "Mi", thu: "Do", fri: "Fr", sat: "Sa", sun: "So",
 };
 
+/** Scheduler accepts daily/workday/weekend tokens — expand them to real days. */
+function expandDays(days) {
+  const d = (days || []).map((x) => String(x).toLowerCase());
+  if (d.includes("daily")) return WEEK.slice();
+  const out = new Set();
+  for (const x of d) {
+    if (x === "workday") ["mon", "tue", "wed", "thu", "fri"].forEach((y) => out.add(y));
+    else if (x === "weekend") ["sat", "sun"].forEach((y) => out.add(y));
+    else if (WEEK.includes(x)) out.add(x);
+  }
+  return WEEK.filter((x) => out.has(x));
+}
+
 /** Compact label for a set of weekdays: Mo–Fr, Sa–So, Täglich, or Mo, Mi, Fr */
 function daysLabel(days) {
-  const d = (days || []).map((x) => String(x).toLowerCase());
-  if (d.includes("daily") || d.length === 7) return "Täglich";
-  if (d.includes("workday")) return "Werktags";
-  if (d.includes("weekend")) return "Wochenende";
-  const set = new Set(d);
-  const idx = WEEK.filter((x) => set.has(x));
-  if (idx.length === 5 && !set.has("sat") && !set.has("sun")) return "Mo–Fr";
-  if (idx.length === 2 && set.has("sat") && set.has("sun")) return "Sa–So";
+  const idx = expandDays(days);
+  if (idx.length === 7) return "Täglich";
   if (idx.length === 0) return "—";
+  if (idx.length === 5 && !idx.includes("sat") && !idx.includes("sun")) return "Mo–Fr";
+  if (idx.length === 2 && idx.includes("sat") && idx.includes("sun")) return "Sa–So";
   const pos = idx.map((x) => WEEK.indexOf(x));
   const run = pos.every((p, i) => i === 0 || p === pos[i - 1] + 1);
   if (run && pos.length > 2)
@@ -84,15 +93,15 @@ function daysLabel(days) {
   return idx.map((x) => WEEK_LABEL[x]).join(", ");
 }
 
+/** Sort key so Monday always comes first and Sunday last. */
+function daySortKey(days) {
+  const idx = expandDays(days).map((x) => WEEK.indexOf(x));
+  return idx.length ? Math.min(...idx) : 99;
+}
+
 /** Does this weekday set cover "today"? */
 function coversToday(days) {
-  const d = (days || []).map((x) => String(x).toLowerCase());
-  const today = WEEK[(new Date().getDay() + 6) % 7];
-  const weekend = today === "sat" || today === "sun";
-  if (d.includes("daily")) return true;
-  if (d.includes("workday")) return !weekend;
-  if (d.includes("weekend")) return weekend;
-  return d.includes(today);
+  return expandDays(days).includes(WEEK[(new Date().getDay() + 6) % 7]);
 }
 
 /* -------------------------------------------------- schedule <-> blocks */
@@ -144,15 +153,26 @@ function cleanConditions(conditions) {
   });
 }
 
+/** Make sure the mode switches are present as "must be off" conditions. */
+function withModeConditions(conditions, modes) {
+  const out = cleanConditions(conditions);
+  for (const ent of [modes.summer, modes.away]) {
+    if (!ent) continue;
+    if (!out.some((c) => c.entity_id === ent))
+      out.push({ entity_id: ent, value: "off", match_type: "is" });
+  }
+  return out;
+}
+
 /**
  * Heat blocks -> full-day timeslots, re-using the conditions and action shape
  * of the existing schedule so nothing is silently dropped on save.
  */
-function toTimeslots(item, blocks) {
+function toTimeslots(item, blocks, modes) {
   const first = (item.timeslots || [])[0] || {};
   const entity = scheduleEntity(item);
   const base = {
-    conditions: cleanConditions(first.conditions),
+    conditions: withModeConditions(first.conditions, modes || {}),
     condition_type: first.condition_type || "and",
     track_conditions:
       first.track_conditions === undefined ? true : first.track_conditions,
@@ -209,6 +229,20 @@ function normalise(blocks, minLen) {
   return out.filter((b) => b.stop - b.start >= minLen);
 }
 
+/** The free stretch around `at`, so a new block can never swallow its neighbours. */
+function gapAround(blocks, at) {
+  let lo = 0;
+  let hi = DAY;
+  for (const b of blocks) {
+    if (b.stop <= at) lo = Math.max(lo, b.stop);
+    if (b.start >= at) {
+      hi = Math.min(hi, b.start);
+      break;
+    }
+  }
+  return { lo, hi };
+}
+
 /* ------------------------------------------------------------------- card */
 
 class HeatTimelineCard extends HTMLElement {
@@ -217,11 +251,14 @@ class HeatTimelineCard extends HTMLElement {
     this.attachShadow({ mode: "open" });
     this._items = [];   // schedules straight from the scheduler websocket api
     this._draft = {};   // schedule_id -> blocks being edited
+    this._days = {};    // schedule_id -> weekdays being edited
     this._dirty = {};   // schedule_id -> true
     this._edit = null;  // {id, index} of the open block editor
+    this._open = {};    // schedule_id -> day/settings strip expanded
     this._loaded = false;
     this._drag = null;
     this._tick = null;
+    this._busy = false;
   }
 
   static getStubConfig() {
@@ -229,7 +266,7 @@ class HeatTimelineCard extends HTMLElement {
   }
 
   setConfig(config) {
-    this._config = Object.assign(
+    const cfg = Object.assign(
       {
         title: "Heizung",
         step: 15,
@@ -237,10 +274,20 @@ class HeatTimelineCard extends HTMLElement {
         max_temp: 30,
         temp_step: 0.5,
         show_now: true,
+        show_modes: true,
         entities: null,
+        modes: {},
       },
       config || {}
     );
+    cfg.modes = Object.assign(
+      {
+        summer: "input_boolean.heat_timeline_summer",
+        away: "input_boolean.heat_timeline_away",
+      },
+      config && config.modes ? config.modes : {}
+    );
+    this._config = cfg;
     this._render();
   }
 
@@ -295,6 +342,7 @@ class HeatTimelineCard extends HTMLElement {
         type: "scheduler",
       });
       this._draft = {};
+      this._days = {};
       this._render();
     } catch (e) {
       /* keep showing the previous data */
@@ -307,11 +355,17 @@ class HeatTimelineCard extends HTMLElement {
     return this._draft[item.schedule_id];
   }
 
+  _weekdays(item) {
+    if (!this._days[item.schedule_id])
+      this._days[item.schedule_id] = expandDays(item.weekdays);
+    return this._days[item.schedule_id];
+  }
+
   _itemById(id) {
     return this._items.find((x) => x.schedule_id === id);
   }
 
-  /** Schedules grouped by the climate entity they control. */
+  /** Schedules grouped by the climate entity they control, Monday first. */
   _rooms() {
     const want = this._config && this._config.entities;
     const map = new Map();
@@ -325,36 +379,174 @@ class HeatTimelineCard extends HTMLElement {
     for (const list of map.values())
       list.sort(
         (a, b) =>
-          (coversToday(b.weekdays) ? 1 : 0) - (coversToday(a.weekdays) ? 1 : 0)
+          daySortKey(this._days[a.schedule_id] || a.weekdays) -
+            daySortKey(this._days[b.schedule_id] || b.weekdays) ||
+          String(a.name || "").localeCompare(String(b.name || ""))
       );
     return [...map.entries()].map(([entity, schedules]) => ({ entity, schedules }));
   }
 
-  async _save(item) {
+  /* ------------------------------------------------------------ modes */
+
+  _modeState(which) {
+    const ent = this._config.modes[which];
+    const st = ent && this._hass.states[ent];
+    return st ? st.state === "on" : null; // null = helper missing
+  }
+
+  _modesReady() {
+    return ["summer", "away"].every((k) => this._modeState(k) !== null);
+  }
+
+  /** Create the two mode helpers this package needs, then attach them. */
+  async _setupModes() {
+    if (this._busy) return;
+    this._busy = true;
+    this._render();
+    const wanted = [
+      ["summer", "Sommermodus", "mdi:white-balance-sunny"],
+      ["away", "Unterwegs", "mdi:bag-suitcase"],
+    ];
+    try {
+      for (const [key, name, icon] of wanted) {
+        const ent = this._config.modes[key];
+        if (!ent || this._hass.states[ent]) continue;
+        await this._hass.connection.sendMessagePromise({
+          type: "input_boolean/create",
+          name: name,
+          icon: icon,
+        });
+      }
+      // attach them as conditions to every schedule this card manages
+      for (const room of this._rooms())
+        for (const item of room.schedules) await this._save(item, true);
+    } catch (e) {
+      this._error = "Die Modus-Schalter konnten nicht angelegt werden: " + e.message;
+    }
+    this._busy = false;
+    await this._reload();
+  }
+
+  async _toggleMode(which) {
+    const ent = this._config.modes[which];
+    if (!ent) return;
+    const on = this._modeState(which);
+    await this._hass.callService("input_boolean", on ? "turn_off" : "turn_on", {
+      entity_id: ent,
+    });
+    if (!on) {
+      // Turning a mode ON has to stop current heating: Scheduler only re-applies
+      // actions when conditions become *valid* again, never when they break.
+      const targets = this._rooms().map((r) => r.entity);
+      if (targets.length)
+        await this._hass.callService("climate", "set_hvac_mode", {
+          entity_id: targets,
+          hvac_mode: "off",
+        });
+    }
+    // Turning it OFF needs no action: track_conditions re-applies the slot.
+  }
+
+  /* ----------------------------------------------------------- writing */
+
+  async _save(item, quiet) {
     const blocks = normalise(this._blocks(item), this._config.step);
     this._draft[item.schedule_id] = blocks;
+    const days = this._weekdays(item);
     const data = {
       entity_id: item.entity_id,
-      weekdays: item.weekdays,
+      weekdays: days.length ? days : ["daily"],
       repeat_type: item.repeat_type || "repeat",
-      timeslots: toTimeslots(item, blocks),
+      timeslots: toTimeslots(item, blocks, this._config.modes),
     };
     if (item.name) data.name = item.name;
     try {
       await this._hass.callService("scheduler", "edit", data);
       delete this._dirty[item.schedule_id];
-      this._flash(item.schedule_id, "ok");
+      if (!quiet) this._flash(item.schedule_id, "ok");
     } catch (e) {
-      this._flash(item.schedule_id, "err");
+      if (!quiet) this._flash(item.schedule_id, "err");
     }
-    this._render();
+    if (!quiet) this._render();
   }
 
   _revert(item) {
     delete this._draft[item.schedule_id];
+    delete this._days[item.schedule_id];
     delete this._dirty[item.schedule_id];
     this._edit = null;
     this._render();
+  }
+
+  /** New schedule for a room, inheriting conditions from an existing one. */
+  async _addSchedule(room) {
+    if (this._busy) return;
+    this._busy = true;
+    this._render();
+    const template = room.schedules[0];
+    const used = new Set();
+    for (const s of room.schedules)
+      for (const d of expandDays(this._days[s.schedule_id] || s.weekdays)) used.add(d);
+    const free = WEEK.filter((d) => !used.has(d));
+    const days = free.length ? free : WEEK.slice();
+
+    const conditions = withModeConditions(
+      template ? (template.timeslots[0] || {}).conditions : [],
+      this._config.modes
+    );
+    const base = {
+      conditions,
+      condition_type: (template && template.timeslots[0].condition_type) || "and",
+      track_conditions: true,
+    };
+    const mk = (start, stop, temp) =>
+      Object.assign({ start: toTime(start), stop: toTime(stop) }, base, {
+        actions: [
+          temp === null
+            ? {
+                entity_id: room.entity,
+                service: "climate.set_hvac_mode",
+                service_data: { hvac_mode: "off" },
+              }
+            : {
+                entity_id: room.entity,
+                service: "climate.set_temperature",
+                service_data: { temperature: temp, hvac_mode: "heat" },
+              },
+        ],
+      });
+    const st = this._hass.states[room.entity];
+    const name = (st && st.attributes.friendly_name) || room.entity.split(".")[1];
+    try {
+      await this._hass.callService("scheduler", "add", {
+        name: name + " " + daysLabel(days),
+        weekdays: days,
+        repeat_type: "repeat",
+        timeslots: [mk(0, 360, null), mk(360, 1320, 20), mk(1320, DAY, null)],
+      });
+    } catch (e) {
+      this._error = "Zeitplan konnte nicht angelegt werden: " + e.message;
+    }
+    this._busy = false;
+    await this._reload();
+  }
+
+  async _removeSchedule(item) {
+    if (this._busy) return;
+    this._busy = true;
+    this._render();
+    try {
+      await this._hass.callService("scheduler", "remove", {
+        entity_id: item.entity_id,
+      });
+    } catch (e) {
+      this._error = "Zeitplan konnte nicht gelöscht werden: " + e.message;
+    }
+    delete this._draft[item.schedule_id];
+    delete this._days[item.schedule_id];
+    delete this._dirty[item.schedule_id];
+    this._busy = false;
+    await this._reload();
   }
 
   _flash(id, kind) {
@@ -384,7 +576,9 @@ class HeatTimelineCard extends HTMLElement {
       kids.push(h("div", { class: "pad err", text: this._error }));
     } else {
       const rooms = this._rooms();
-      if (!rooms.length) {
+      if (this._config.title || this._config.show_modes)
+        kids.push(this._header());
+      if (!rooms.length)
         kids.push(
           h("div", {
             class: "pad muted",
@@ -393,13 +587,40 @@ class HeatTimelineCard extends HTMLElement {
               "für ein climate-Gerät an.",
           })
         );
-      } else {
-        if (this._config.title)
-          kids.push(h("div", { class: "hdr", text: this._config.title }));
-        for (const r of rooms) kids.push(this._room(r));
-      }
+      else for (const r of rooms) kids.push(this._room(r));
     }
     this._card.replaceChildren(...kids);
+  }
+
+  _header() {
+    const kids = [];
+    if (this._config.title)
+      kids.push(h("div", { class: "hdr-title", text: this._config.title }));
+    kids.push(h("span", { class: "grow" }));
+
+    if (this._config.show_modes) {
+      if (!this._modesReady()) {
+        kids.push(
+          h("button", {
+            class: "btn ghost sm",
+            text: this._busy ? "Wird angelegt…" : "Modi einrichten",
+            disabled: this._busy ? "true" : null,
+            onclick: () => this._setupModes(),
+          })
+        );
+      } else {
+        const chip = (which, label) => {
+          const on = this._modeState(which);
+          return h("button", {
+            class: "mode" + (on ? " on" : ""),
+            text: label,
+            onclick: () => this._toggleMode(which),
+          });
+        };
+        kids.push(chip("summer", "Sommer"), chip("away", "Unterwegs"));
+      }
+    }
+    return h("div", { class: "hdr" }, kids);
   }
 
   _room(room) {
@@ -414,6 +635,15 @@ class HeatTimelineCard extends HTMLElement {
       room.schedules.some((s) => s.schedule_id === this._flashState.id)
         ? this._flashState.kind
         : null;
+
+    // days claimed by more than one schedule of this room
+    const seen = {};
+    const clash = new Set();
+    for (const s of room.schedules)
+      for (const d of expandDays(this._days[s.schedule_id] || s.weekdays)) {
+        if (seen[d]) clash.add(d);
+        seen[d] = true;
+      }
 
     const head = h(
       "div",
@@ -450,20 +680,37 @@ class HeatTimelineCard extends HTMLElement {
       h("span", { class: "last", text: "24" })
     );
 
-    const actions = dirty
-      ? h(
-          "div",
-          { class: "actions" },
-          h("button", {
-            class: "btn ghost",
+    const foot = h(
+      "div",
+      { class: "actions" },
+      clash.size
+        ? h("span", {
+            class: "pill err",
+            text:
+              "Doppelt belegt: " +
+              [...clash].map((d) => WEEK_LABEL[d]).join(", "),
+          })
+        : null,
+      h("span", { class: "grow" }),
+      h("button", {
+        class: "btn ghost sm",
+        text: "+ Zeitplan",
+        disabled: this._busy ? "true" : null,
+        onclick: () => this._addSchedule(room),
+      }),
+      dirty
+        ? h("button", {
+            class: "btn ghost sm",
             text: "Verwerfen",
             onclick: () => {
               this._edit = null;
               room.schedules.forEach((s) => this._revert(s));
             },
-          }),
-          h("button", {
-            class: "btn primary",
+          })
+        : null,
+      dirty
+        ? h("button", {
+            class: "btn primary sm",
             text: "Speichern",
             onclick: () => {
               this._edit = null;
@@ -472,8 +719,8 @@ class HeatTimelineCard extends HTMLElement {
               );
             },
           })
-        )
-      : null;
+        : null
+    );
 
     return h(
       "div",
@@ -481,7 +728,7 @@ class HeatTimelineCard extends HTMLElement {
       head,
       room.schedules.map((s) => this._row(s)),
       scale,
-      actions
+      foot
     );
   }
 
@@ -489,7 +736,8 @@ class HeatTimelineCard extends HTMLElement {
     const id = item.schedule_id;
     const blocks = normalise(this._blocks(item), this._config.step);
     this._draft[id] = blocks;
-    const today = coversToday(item.weekdays);
+    const days = this._weekdays(item);
+    const today = coversToday(days);
     const now = new Date();
 
     const track = h("div", {
@@ -528,15 +776,53 @@ class HeatTimelineCard extends HTMLElement {
     const row = h(
       "div",
       { class: "row" },
-      h("div", {
-        class: "row-lbl" + (today ? " today" : ""),
-        text: daysLabel(item.weekdays),
+      h("button", {
+        class: "row-lbl" + (today ? " today" : "") + (this._open[id] ? " sel" : ""),
+        text: daysLabel(days),
+        onclick: () => {
+          this._open[id] = !this._open[id];
+          this._render();
+        },
       }),
       track
     );
 
+    const extras = [row];
+    if (this._open[id]) extras.push(this._daysStrip(item, days));
     const ed = this._editor(item, blocks);
-    return ed ? h("div", { class: "rowwrap" }, row, ed) : row;
+    if (ed) extras.push(ed);
+    return extras.length === 1 ? row : h("div", { class: "rowwrap" }, extras);
+  }
+
+  _daysStrip(item, days) {
+    const id = item.schedule_id;
+    const set = new Set(days);
+    const chips = WEEK.map((d) =>
+      h("button", {
+        class: "day" + (set.has(d) ? " on" : ""),
+        text: WEEK_LABEL[d],
+        onclick: () => {
+          const cur = new Set(this._weekdays(item));
+          if (cur.has(d)) cur.delete(d);
+          else cur.add(d);
+          this._days[id] = WEEK.filter((x) => cur.has(x));
+          this._dirty[id] = true;
+          this._render();
+        },
+      })
+    );
+    return h(
+      "div",
+      { class: "days" },
+      chips,
+      h("span", { class: "grow" }),
+      h("button", {
+        class: "btn ghost sm danger",
+        text: "Zeitplan löschen",
+        disabled: this._busy ? "true" : null,
+        onclick: () => this._removeSchedule(item),
+      })
+    );
   }
 
   _editor(item, blocks) {
@@ -596,7 +882,7 @@ class HeatTimelineCard extends HTMLElement {
         h("span", { class: "grow" }),
         h("button", {
           class: "btn ghost sm",
-          text: "Löschen",
+          text: "Block löschen",
           onclick: () => {
             const list = this._draft[id];
             if (!list || !this._edit) return;
@@ -648,11 +934,15 @@ class HeatTimelineCard extends HTMLElement {
         grab: at,
         orig: Object.assign({}, blocks[i]),
         moved: false,
+        gap: gapAround(blocks.filter((_, k) => k !== i), at),
       };
     } else {
-      // empty track: drop a fresh block and size it by dragging
-      const start = this._snap(at);
-      const nb = { start, stop: Math.min(start + this._config.step, DAY), temp: 20 };
+      // New block, confined to the free stretch it was started in, so it can
+      // never swallow the blocks around it.
+      const gap = gapAround(blocks, at);
+      if (gap.hi - gap.lo < this._config.step) return;
+      const start = clamp(this._snap(at), gap.lo, gap.hi - this._config.step);
+      const nb = { start, stop: Math.min(start + this._config.step, gap.hi), temp: 20 };
       const sorted = blocks.concat([nb]).sort((a, b) => a.start - b.start);
       this._draft[id] = sorted;
       this._dirty[id] = true;
@@ -665,6 +955,7 @@ class HeatTimelineCard extends HTMLElement {
         orig: Object.assign({}, nb),
         moved: true,
         created: true,
+        gap,
       };
       this._render();
     }
@@ -703,14 +994,17 @@ class HeatTimelineCard extends HTMLElement {
     if (!b) return;
     const at = this._pos(e, d.track);
     const step = this._config.step;
+    const gap = d.gap || { lo: 0, hi: DAY };
 
     if (Math.abs(at - d.grab) > 4) d.moved = true;
 
-    if (d.mode === "start") b.start = clamp(this._snap(at), 0, b.stop - step);
-    else if (d.mode === "stop") b.stop = clamp(this._snap(at), b.start + step, DAY);
-    else {
+    if (d.mode === "start") {
+      b.start = clamp(this._snap(at), gap.lo, b.stop - step);
+    } else if (d.mode === "stop") {
+      b.stop = clamp(this._snap(at), b.start + step, gap.hi);
+    } else {
       const len = d.orig.stop - d.orig.start;
-      const s = clamp(this._snap(d.orig.start + (at - d.grab)), 0, DAY - len);
+      const s = clamp(this._snap(d.orig.start + (at - d.grab)), gap.lo, gap.hi - len);
       b.start = s;
       b.stop = s + len;
     }
@@ -760,9 +1054,9 @@ ha-card { overflow:hidden; }
 .pad { padding:16px; }
 .muted { color:var(--secondary-text-color); font-size:14px; }
 .err { color:var(--error-color,#db4437); font-size:14px; }
-.hdr { padding:14px 16px 2px; font-size:16px; font-weight:600;
-       color:var(--primary-text-color); }
-.room { padding:12px 16px 14px; }
+.hdr { display:flex; align-items:center; gap:8px; padding:13px 16px 4px; }
+.hdr-title { font-size:16px; font-weight:600; color:var(--primary-text-color); }
+.room { padding:12px 16px 12px; }
 .room + .room { border-top:1px solid var(--divider-color,rgba(128,128,128,.2)); }
 .room-hd { display:flex; align-items:center; gap:8px; margin-bottom:9px; }
 .room-name { font-size:15px; font-weight:600; color:var(--primary-text-color); }
@@ -776,10 +1070,21 @@ ha-card { overflow:hidden; }
 .pill.ok   { background:rgba(76,175,80,.16); color:#4CAF50; }
 .pill.err  { background:rgba(219,68,55,.16); color:#DB4437; }
 
+.mode {
+  border:none; cursor:pointer; border-radius:999px; padding:5px 12px;
+  font-size:11.5px; font-weight:600;
+  background:rgba(128,128,128,.18); color:var(--secondary-text-color);
+}
+.mode.on { background:rgba(244,113,28,.18); color:#F4711C; }
+
 .row { display:flex; align-items:center; gap:10px; margin-top:7px; }
-.row-lbl { flex:0 0 52px; font-size:11px; font-weight:600;
-           color:var(--secondary-text-color); }
+.row-lbl {
+  flex:0 0 62px; text-align:left; font-size:11px; font-weight:600; cursor:pointer;
+  color:var(--secondary-text-color); background:none; border:none; padding:4px 2px;
+  border-radius:6px;
+}
 .row-lbl.today { color:var(--primary-text-color); }
+.row-lbl.sel { background:rgba(128,128,128,.18); }
 .track { position:relative; flex:1; height:30px; border-radius:8px;
          background:rgba(128,128,128,.20); touch-action:none; cursor:copy; }
 .blk { position:absolute; top:0; bottom:0; border-radius:7px;
@@ -796,11 +1101,19 @@ ha-card { overflow:hidden; }
 .now { position:absolute; top:-4px; bottom:-4px; width:2px; margin-left:-1px;
        background:var(--primary-text-color); border-radius:2px; pointer-events:none;
        box-shadow:0 0 0 1.5px var(--ha-card-background,var(--card-background-color,#fff)); }
-.scale { display:flex; margin:6px 0 0 62px; }
+.scale { display:flex; margin:6px 0 0 72px; }
 .scale span { flex:1; font-size:9.5px; color:var(--secondary-text-color); opacity:.75; }
 .scale .last { flex:0 0 auto; }
 
-.editor { margin:9px 0 2px 62px; padding:10px 12px; border-radius:10px;
+.days { display:flex; align-items:center; gap:5px; margin:8px 0 2px 72px; flex-wrap:wrap; }
+.day {
+  border:none; cursor:pointer; width:30px; height:26px; border-radius:7px;
+  font-size:10.5px; font-weight:700;
+  background:rgba(128,128,128,.18); color:var(--secondary-text-color);
+}
+.day.on { background:rgba(244,113,28,.20); color:#F4711C; }
+
+.editor { margin:9px 0 2px 72px; padding:10px 12px; border-radius:10px;
           background:rgba(128,128,128,.12); }
 .ed-row { display:flex; align-items:center; gap:10px; }
 .ed-row + .ed-row { margin-top:8px; }
@@ -811,12 +1124,15 @@ ha-card { overflow:hidden; }
         background:rgba(128,128,128,.22); color:var(--primary-text-color);
         font-size:18px; line-height:1; }
 .slider { flex:1; accent-color:#F4711C; }
-.actions { display:flex; justify-content:flex-end; gap:8px; margin-top:10px; }
+.actions { display:flex; align-items:center; justify-content:flex-end; gap:8px;
+           margin-top:10px; }
 .btn { border:none; border-radius:8px; padding:7px 14px; font-size:13px;
        font-weight:600; cursor:pointer; }
 .btn.sm { padding:5px 10px; font-size:12px; }
 .btn.ghost { background:rgba(128,128,128,.18); color:var(--primary-text-color); }
 .btn.primary { background:#F4711C; color:#fff; }
+.btn.danger { color:var(--error-color,#db4437); }
+.btn[disabled] { opacity:.5; cursor:default; }
 `;
 
 /* ------------------------------------------------------------- register */
@@ -830,7 +1146,7 @@ if (!window.customCards.some((c) => c.type === "heat-timeline-card"))
     type: "heat-timeline-card",
     name: "Heat Timeline Card",
     description:
-      "Wöchentlicher Heizplan als Zeitstrahl — Blöcke ziehen, Temperatur setzen.",
+      "Wöchentlicher Heizplan als Zeitstrahl — Blöcke ziehen, Tage wählen, Modi schalten.",
     preview: false,
   });
 
@@ -842,4 +1158,7 @@ console.info(
 
 // The pure schedule<->blocks helpers are exported so they can be tested
 // without a DOM.
-export { HeatTimelineCard, toBlocks, toTimeslots, normalise, daysLabel, coversToday };
+export {
+  HeatTimelineCard, toBlocks, toTimeslots, normalise, daysLabel, coversToday,
+  expandDays, daySortKey, gapAround, withModeConditions,
+};

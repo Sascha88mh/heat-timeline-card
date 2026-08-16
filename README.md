@@ -17,20 +17,42 @@ bars and lets you drag them.
 ## What it does
 
 - **One card per room.** Every schedule that drives the same `climate` entity is
-  grouped together, one row per weekday group (Mo–Fr, Sa–So, or whatever you set
-  up).
+  grouped together, one row per weekday group, **Monday first**.
 - **Drag to change.** Drag a block's edge to move the start or end, drag its
   middle to shift the whole period. Everything snaps to 15 minutes by default.
 - **Drag on empty track to add.** Press where you want heat to start and pull.
+  A new block stops at its neighbours — it can never swallow them.
 - **Tap a block** to set its target temperature, or delete it.
+- **Pick the days.** Tap a row's day label to open the weekday chips: add
+  Saturday to the workweek plan, split a single day off into its own schedule,
+  whatever fits. **+ Zeitplan** adds another row for the days still free,
+  inheriting the room's conditions. A day claimed by two schedules is flagged.
+- **Summer and Away mode built in.** Two switches in the card header, no extra
+  setup: press **Modi einrichten** once and the card creates the helpers and
+  attaches them to every schedule as a condition.
 - **Now marker** on whichever row applies today.
 - **Nothing is written until you press Save.** Until then the card shows an
   "Ungespeichert" badge and a Discard button.
 
-Conditions you attached to a schedule (open windows, a summer-mode toggle, a
-presence flag) are **preserved on save** — the card reads the full schedule over
-the Scheduler websocket API rather than the trimmed-down entity attributes, and
-writes every condition back untouched.
+Conditions you attached to a schedule (open windows, a presence flag) are
+**preserved on save** — the card reads the full schedule over the Scheduler
+websocket API rather than the trimmed-down entity attributes, and writes every
+condition back untouched.
+
+### How the modes behave
+
+Both modes are plain `input_boolean` helpers, added to every managed schedule as
+an "is off" condition. While either is on, no schedule heats.
+
+Switching a mode **on** also turns the managed thermostats off right away,
+because Scheduler re-applies a slot only when conditions become *valid* — it
+never undoes anything when they break. Switching a mode **off** needs no action
+at all: `track_conditions` makes Scheduler re-apply the current slot by itself.
+
+One consequence worth knowing: the immediate switch-off is issued by the card.
+If you flip the helper somewhere else — a dashboard toggle, a voice command —
+running heat keeps running until the next slot boundary. Add a small automation
+if you need that covered.
 
 ## Requirements
 
@@ -66,15 +88,18 @@ automatically.
 
 ### Options
 
-| Option      | Type    | Default    | Description                                              |
-| ----------- | ------- | ---------- | -------------------------------------------------------- |
-| `title`     | string  | `Heizung`  | Card heading. Set to `false`/`""` to hide.                |
-| `entities`  | list    | *all*      | Restrict to specific `climate` entities.                  |
-| `step`      | number  | `15`       | Snap grid in minutes.                                     |
-| `min_temp`  | number  | `5`        | Lower bound of the temperature control.                   |
-| `max_temp`  | number  | `30`       | Upper bound of the temperature control.                   |
-| `temp_step` | number  | `0.5`      | Increment of the +/− buttons and the slider.              |
-| `show_now`  | boolean | `true`     | Draw the "now" marker on today's row.                     |
+| Option        | Type    | Default    | Description                                              |
+| ------------- | ------- | ---------- | -------------------------------------------------------- |
+| `title`       | string  | `Heizung`  | Card heading. Set to `false`/`""` to hide.                |
+| `entities`    | list    | *all*      | Restrict to specific `climate` entities.                  |
+| `step`        | number  | `15`       | Snap grid in minutes.                                     |
+| `min_temp`    | number  | `5`        | Lower bound of the temperature control.                   |
+| `max_temp`    | number  | `30`       | Upper bound of the temperature control.                   |
+| `temp_step`   | number  | `0.5`      | Increment of the +/− buttons and the slider.              |
+| `show_now`    | boolean | `true`     | Draw the "now" marker on today's row.                     |
+| `show_modes`  | boolean | `true`     | Show the summer/away switches in the header.              |
+| `modes.summer`| string  | `input_boolean.heat_timeline_summer` | Helper backing summer mode.     |
+| `modes.away`  | string  | `input_boolean.heat_timeline_away`   | Helper backing away mode.       |
 
 ```yaml
 type: custom:heat-timeline-card
@@ -84,6 +109,16 @@ entities:
   - climate.kueche
 step: 30
 temp_step: 0.5
+```
+
+Point `modes` at helpers you already have instead of letting the card create
+its own:
+
+```yaml
+type: custom:heat-timeline-card
+modes:
+  summer: input_boolean.sommermodus
+  away: input_boolean.unterwegs
 ```
 
 ## How a schedule is interpreted
@@ -100,7 +135,7 @@ what makes the timeline unambiguous.
 
 ## Known limitations
 
-- The card edits **times and temperatures**. Weekday groups, conditions and
+- The card edits **times, temperatures and weekdays**. Conditions beyond the two modes and
   repeat behaviour are still set in `scheduler-card` or via
   `scheduler.add` / `scheduler.edit`.
 - Sun-relative times (`sunrise+01:00`) are not represented on the timeline yet;
