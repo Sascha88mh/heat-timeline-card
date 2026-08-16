@@ -7,7 +7,7 @@
  * so entity names and user config can never inject markup.
  */
 
-const VERSION = "0.5.1";
+const VERSION = "0.6.0";
 const DAY = 1440;
 
 /* ------------------------------------------------------------------ utils */
@@ -284,6 +284,7 @@ class HeatTimelineCard extends HTMLElement {
     this._target = {};  // schedule_id -> climate entity being reassigned
     this._pick = {};    // picker key -> selected value, kept across renders
     this._nameDraft = {}; // climate entity -> name being typed
+    this._addOpen = false; // "add a room" form revealed
     this._sig = "";
     this._loaded = false;
     this._drag = null;
@@ -922,7 +923,25 @@ class HeatTimelineCard extends HTMLElement {
           })
         );
       else for (const r of rooms) kids.push(this._room(r));
-      kids.push(h("div", { class: "room addroom" }, this._addRoomPanel()));
+      kids.push(
+        h(
+          "div",
+          { class: "room addroom" },
+          h(
+            "div",
+            { class: "addbar" },
+            h("button", {
+              class: "btn ghost sm" + (this._addOpen ? " on" : ""),
+              text: this._addOpen ? "Abbrechen" : "+ Hinzufügen",
+              onclick: () => {
+                this._addOpen = !this._addOpen;
+                this._render();
+              },
+            })
+          ),
+          this._addOpen || !rooms.length ? this._addRoomPanel() : null
+        )
+      );
     }
     this._card.replaceChildren(...kids);
     this._sig = this._signature();
@@ -1241,6 +1260,7 @@ class HeatTimelineCard extends HTMLElement {
     }
     this._target = {};
     this._pick = {};
+    this._addOpen = false;
     this._busy = false;
     await this._reload();
   }
@@ -1866,7 +1886,9 @@ ha-card { overflow:hidden; }
           background:rgba(128,128,128,.22); color:var(--secondary-text-color); }
 .toggle.on { background:rgba(244,113,28,.20); color:#F4711C; }
 .toggle[disabled] { opacity:.5; cursor:default; }
-.addroom { padding-top:14px; }
+.addroom { padding-top:10px; }
+.addbar { display:flex; justify-content:flex-end; }
+.addbar + .wpanel { margin-top:10px; }
 .gear { border:none; background:none; cursor:pointer; font-size:15px; line-height:1;
         padding:3px 5px; border-radius:8px; color:var(--secondary-text-color); }
 .gear:hover { color:var(--primary-text-color); }

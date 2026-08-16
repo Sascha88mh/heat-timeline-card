@@ -34,8 +34,9 @@ bars and lets you drag them.
   door/window sensors to the room; sensors sitting in the same HA area are
   offered first. Assigned windows that are currently open are highlighted, so
   you can see at a glance why a room is not heating.
-- **Start from nothing.** No schedules yet? Pick a thermostat under
-  **Raum hinzufügen** and the card lays down a Mo–Fr and a Sa–So plan to edit.
+- **Start from nothing.** No schedules yet? The card opens straight on the
+  thermostat picker and lays down a Mo–Fr and a Sa–So plan to edit. Later on,
+  the same form hides behind a small **+ Hinzufügen**.
 - **One gear per room.** Every setting — name, order, windows, thermostat, extra
   schedules, deleting the room — sits behind the ⚙ in the room header, so the
   timeline itself stays free of controls.
