@@ -36,9 +36,11 @@ bars and lets you drag them.
   you can see at a glance why a room is not heating.
 - **Start from nothing.** No schedules yet? Pick a thermostat under
   **Raum hinzufügen** and the card lays down a Mo–Fr and a Sa–So plan to edit.
-- **Edit the room itself.** **Raum** lets you point every schedule of a room at
-  a different thermostat — times, days and windows come along — or delete the
-  room and its schedules in one go.
+- **One gear per room.** Every setting — name, order, windows, thermostat, extra
+  schedules, deleting the room — sits behind the ⚙ in the room header, so the
+  timeline itself stays free of controls.
+- **Name and order your rooms.** Rename a room (it renames the thermostat in
+  Home Assistant) and move it up or down with the arrows.
 
 - **Now marker** on whichever row applies today.
 - **Nothing is written until you press Save.** Until then the card shows an
@@ -94,6 +96,12 @@ else in your automation list is touched.
 Both halves are optional and independent: use the condition alone if you only
 want to stop schedules from firing into an open window.
 
+Whenever you save a room or switch that rule on, the card also checks the guards
+**against the present moment** and switches the room off if they say so. Without
+that step, assigning an already-open window to a room that is currently heating
+would change nothing until the next slot boundary — the condition was never
+evaluated again and the automation never saw the window open.
+
 ## Requirements
 
 - Home Assistant 2024.1 or newer
@@ -140,6 +148,7 @@ automatically.
 | `show_modes`  | boolean | `true`     | Show the summer/away switches in the header.              |
 | `modes.summer`| string  | `input_boolean.heat_timeline_summer` | Helper backing summer mode.     |
 | `modes.away`  | string  | `input_boolean.heat_timeline_away`   | Helper backing away mode.       |
+| `order`       | list    | —          | Room order, as `climate.*` entity ids. Without it the ⚙ arrows decide, stored per browser. |
 
 ```yaml
 type: custom:heat-timeline-card
