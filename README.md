@@ -40,6 +40,15 @@ bars and lets you drag them.
   a different thermostat — times, days and windows come along — or delete the
   room and its schedules in one go.
 
+- **Now marker** on whichever row applies today.
+- **Nothing is written until you press Save.** Until then the card shows an
+  "Ungespeichert" badge and a Discard button.
+
+Conditions you attached to a schedule (open windows, a presence flag) are
+**preserved on save** — the card reads the full schedule over the Scheduler
+websocket API rather than the trimmed-down entity attributes, and writes every
+condition back untouched.
+
 ### New devices show up on their own
 
 Thermostats and window sensors are read from Home Assistant's live state, so a
@@ -50,14 +59,6 @@ The card redraws only when something it displays has actually changed — a room
 thermostat, one of its windows, a mode switch, or the set of entities itself.
 That matters: Home Assistant pushes *every* state change in the house, and
 redrawing on each one would reset an open picker several times a second.
-- **Now marker** on whichever row applies today.
-- **Nothing is written until you press Save.** Until then the card shows an
-  "Ungespeichert" badge and a Discard button.
-
-Conditions you attached to a schedule (open windows, a presence flag) are
-**preserved on save** — the card reads the full schedule over the Scheduler
-websocket API rather than the trimmed-down entity attributes, and writes every
-condition back untouched.
 
 ### How the modes behave
 
