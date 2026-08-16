@@ -131,6 +131,20 @@ function scheduleEntity(item) {
 }
 
 /**
+ * Scheduler reports conditions with `attribute: null`, but its own `edit`
+ * schema rejects a null there ("string value is None"). Round-tripping a
+ * schedule therefore has to drop empty keys first.
+ */
+function cleanConditions(conditions) {
+  return (conditions || []).map((c) => {
+    const out = {};
+    for (const k of Object.keys(c))
+      if (c[k] !== null && c[k] !== undefined) out[k] = c[k];
+    return out;
+  });
+}
+
+/**
  * Heat blocks -> full-day timeslots, re-using the conditions and action shape
  * of the existing schedule so nothing is silently dropped on save.
  */
@@ -138,7 +152,7 @@ function toTimeslots(item, blocks) {
   const first = (item.timeslots || [])[0] || {};
   const entity = scheduleEntity(item);
   const base = {
-    conditions: first.conditions || [],
+    conditions: cleanConditions(first.conditions),
     condition_type: first.condition_type || "and",
     track_conditions:
       first.track_conditions === undefined ? true : first.track_conditions,
@@ -826,4 +840,6 @@ console.info(
   "color:#F4711C;background:transparent"
 );
 
-export { HeatTimelineCard };
+// The pure schedule<->blocks helpers are exported so they can be tested
+// without a DOM.
+export { HeatTimelineCard, toBlocks, toTimeslots, normalise, daysLabel, coversToday };
