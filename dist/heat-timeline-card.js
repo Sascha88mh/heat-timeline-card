@@ -7,7 +7,7 @@
  * so entity names and user config can never inject markup.
  */
 
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 const DAY = 1440;
 
 /* ------------------------------------------------------------------ utils */
@@ -188,9 +188,9 @@ const WINDOW_CLASSES = ["window", "door", "opening", "garage_door"];
  * Heat blocks -> full-day timeslots, re-using the conditions and action shape
  * of the existing schedule so nothing is silently dropped on save.
  */
-function toTimeslots(item, blocks, modes, conditions) {
+function toTimeslots(item, blocks, modes, conditions, target) {
   const first = (item.timeslots || [])[0] || {};
-  const entity = scheduleEntity(item);
+  const entity = target || scheduleEntity(item);
   const base = {
     conditions: withModeConditions(
       conditions === undefined ? first.conditions : conditions,
@@ -280,6 +280,10 @@ class HeatTimelineCard extends HTMLElement {
     this._edit = null;  // {id, index} of the open block editor
     this._open = {};    // schedule_id -> day/settings strip expanded
     this._panel = {};   // climate entity -> "windows" panel expanded
+    this._roomPanel = {}; // climate entity -> "room" panel expanded
+    this._target = {};  // schedule_id -> climate entity being reassigned
+    this._pick = {};    // picker key -> selected value, kept across renders
+    this._sig = "";
     this._loaded = false;
     this._drag = null;
     this._tick = null;
@@ -319,8 +323,46 @@ class HeatTimelineCard extends HTMLElement {
   set hass(hass) {
     const first = !this._hass;
     this._hass = hass;
-    if (first) this._load();
-    else if (this._loaded && !this._drag) this._render();
+    if (first) {
+      this._load();
+      return;
+    }
+    if (!this._loaded || this._drag) return;
+    // Home Assistant pushes every state change in the house — in a busy home
+    // that is dozens per minute. Re-rendering each time would throw away the
+    // open picker and any half-finished interaction, so only redraw when
+    // something this card actually shows has moved.
+    const sig = this._signature();
+    if (sig === this._sig) return;
+    this._render();
+  }
+
+  /** Fingerprint of everything the card displays. */
+  _signature() {
+    if (!this._hass || !this._config) return "";
+    const parts = [Object.keys(this._hass.states).length];
+    const push = (id) => {
+      const st = id && this._hass.states[id];
+      parts.push(
+        id +
+          "=" +
+          (st
+            ? st.state +
+              "/" +
+              st.attributes.current_temperature +
+              "/" +
+              st.attributes.temperature
+            : "-")
+      );
+    };
+    for (const room of this._rooms()) {
+      push(room.entity);
+      for (const w of this._windows(room)) push(w);
+      parts.push(this._ruleEntity(room) ? "rule" : "norule");
+    }
+    push(this._config.modes.summer);
+    push(this._config.modes.away);
+    return parts.join(",");
   }
 
   getCardSize() {
@@ -454,17 +496,50 @@ class HeatTimelineCard extends HTMLElement {
 
   /* ------------------------------------- "switch off when opened" rule */
 
-  _ruleId(room) {
-    return "heat_timeline_" + room.entity.replace(/[^a-z0-9]+/gi, "_");
+  _ruleIdFor(entity) {
+    return "heat_timeline_" + String(entity).replace(/[^a-z0-9]+/gi, "_");
   }
 
-  _ruleEntity(room) {
-    const id = this._ruleId(room);
+  _ruleEntityFor(entity) {
+    const id = this._ruleIdFor(entity);
     for (const eid of Object.keys(this._hass.states)) {
       if (eid.slice(0, 11) !== "automation.") continue;
       if (this._hass.states[eid].attributes.id === id) return eid;
     }
     return null;
+  }
+
+  _ruleEntity(room) {
+    return this._ruleEntityFor(room.entity);
+  }
+
+  async _writeRule(entity, sensors) {
+    const id = this._ruleIdFor(entity);
+    if (!sensors.length) return this._deleteRule(entity);
+    const st = this._hass.states[entity];
+    const name = (st && st.attributes.friendly_name) || String(entity).split(".")[1];
+    await this._hass.callApi("post", "config/automation/config/" + id, {
+      id: id,
+      alias: name + ": Heizung aus bei offenem Fenster",
+      description: "Angelegt von der Heat Timeline Card.",
+      triggers: [{ trigger: "state", entity_id: sensors, from: "off", to: "on" }],
+      conditions: [],
+      actions: [
+        {
+          action: "climate.set_hvac_mode",
+          target: { entity_id: entity },
+          data: { hvac_mode: "off" },
+        },
+      ],
+      mode: "single",
+    });
+  }
+
+  async _deleteRule(entity) {
+    await this._hass.callApi(
+      "delete",
+      "config/automation/config/" + this._ruleIdFor(entity)
+    );
   }
 
   /**
@@ -476,34 +551,9 @@ class HeatTimelineCard extends HTMLElement {
     if (this._busy) return;
     this._busy = true;
     this._render();
-    const id = this._ruleId(room);
-    const existing = this._ruleEntity(room);
-    const sensors = this._windows(room);
     try {
-      if (existing) {
-        await this._hass.callApi("delete", "config/automation/config/" + id);
-      } else if (sensors.length) {
-        const st = this._hass.states[room.entity];
-        const name =
-          (st && st.attributes.friendly_name) || room.entity.split(".")[1];
-        await this._hass.callApi("post", "config/automation/config/" + id, {
-          id: id,
-          alias: name + ": Heizung aus bei offenem Fenster",
-          description: "Angelegt von der Heat Timeline Card.",
-          triggers: [
-            { trigger: "state", entity_id: sensors, from: "off", to: "on" },
-          ],
-          conditions: [],
-          actions: [
-            {
-              action: "climate.set_hvac_mode",
-              target: { entity_id: room.entity },
-              data: { hvac_mode: "off" },
-            },
-          ],
-          mode: "single",
-        });
-      }
+      if (this._ruleEntity(room)) await this._deleteRule(room.entity);
+      else await this._writeRule(room.entity, this._windows(room));
       await this._hass.callService("automation", "reload", {});
     } catch (e) {
       this._error = "Die Regel konnte nicht gespeichert werden: " + e.message;
@@ -514,34 +564,9 @@ class HeatTimelineCard extends HTMLElement {
 
   /** Keep an existing rule's trigger list in step with the window list. */
   async _syncRule(room) {
-    const existing = this._ruleEntity(room);
-    if (!existing) return;
-    const sensors = this._windows(room);
-    const id = this._ruleId(room);
-    const st = this._hass.states[room.entity];
-    const name = (st && st.attributes.friendly_name) || room.entity.split(".")[1];
+    if (!this._ruleEntity(room)) return;
     try {
-      if (!sensors.length) {
-        await this._hass.callApi("delete", "config/automation/config/" + id);
-      } else {
-        await this._hass.callApi("post", "config/automation/config/" + id, {
-          id: id,
-          alias: name + ": Heizung aus bei offenem Fenster",
-          description: "Angelegt von der Heat Timeline Card.",
-          triggers: [
-            { trigger: "state", entity_id: sensors, from: "off", to: "on" },
-          ],
-          conditions: [],
-          actions: [
-            {
-              action: "climate.set_hvac_mode",
-              target: { entity_id: room.entity },
-              data: { hvac_mode: "off" },
-            },
-          ],
-          mode: "single",
-        });
-      }
+      await this._writeRule(room.entity, this._windows(room));
       await this._hass.callService("automation", "reload", {});
     } catch (e) {
       /* the schedules were saved; the rule stays as it was */
@@ -645,7 +670,11 @@ class HeatTimelineCard extends HTMLElement {
       weekdays: days.length ? days : ["daily"],
       repeat_type: item.repeat_type || "repeat",
       timeslots: toTimeslots(
-        item, blocks, this._config.modes, this._conditions(item)
+        item,
+        blocks,
+        this._config.modes,
+        this._conditions(item),
+        this._target[item.schedule_id]
       ),
     };
     if (item.name) data.name = item.name;
@@ -781,6 +810,29 @@ class HeatTimelineCard extends HTMLElement {
       kids.push(h("div", { class: "room addroom" }, this._addRoomPanel()));
     }
     this._card.replaceChildren(...kids);
+    this._sig = this._signature();
+  }
+
+  /**
+   * A <select> loses its value whenever the card redraws. Keeping the choice in
+   * component state and restoring it makes the pickers survive a re-render.
+   */
+  _select(key, options, placeholder) {
+    const el = h(
+      "select",
+      {
+        class: "picker",
+        onchange: (e) => {
+          this._pick[key] = e.target.value;
+        },
+      },
+      h("option", { value: "", text: placeholder }),
+      options.map((o) => h("option", { value: o.id, text: o.label }))
+    );
+    const want = this._pick[key];
+    if (want && options.some((o) => o.id === want)) el.value = want;
+    else this._pick[key] = "";
+    return el;
   }
 
   _header() {
@@ -884,6 +936,14 @@ class HeatTimelineCard extends HTMLElement {
         : null,
       h("span", { class: "grow" }),
       h("button", {
+        class: "btn ghost sm" + (this._roomPanel[room.entity] ? " on" : ""),
+        text: "Raum",
+        onclick: () => {
+          this._roomPanel[room.entity] = !this._roomPanel[room.entity];
+          this._render();
+        },
+      }),
+      h("button", {
         class: "btn ghost sm" + (this._panel[room.entity] ? " on" : ""),
         text: "Fenster (" + this._windows(room).length + ")",
         onclick: () => {
@@ -929,8 +989,119 @@ class HeatTimelineCard extends HTMLElement {
       room.schedules.map((s) => this._row(s)),
       scale,
       foot,
+      this._roomPanel[room.entity] ? this._roomSettings(room) : null,
       this._panel[room.entity] ? this._windowPanel(room) : null
     );
+  }
+
+  /** Reassign the room to a different thermostat, or drop the room entirely. */
+  _roomSettings(room) {
+    const used = new Set(this._rooms().map((r) => r.entity));
+    const options = Object.keys(this._hass.states)
+      .filter((id) => id.slice(0, 8) === "climate.")
+      .filter((id) => id === room.entity || !used.has(id))
+      .map((id) => ({
+        id,
+        label:
+          (this._hass.states[id].attributes.friendly_name || id) +
+          (id === room.entity ? "  (aktuell)" : ""),
+      }))
+      .sort((a, b) => a.label.localeCompare(b.label));
+
+    const picker = this._select(
+      "room:" + room.entity,
+      options,
+      "Thermostat wählen…"
+    );
+
+    return h(
+      "div",
+      { class: "wpanel" },
+      h("div", { class: "wtitle", text: "Thermostat dieses Raums" }),
+      h(
+        "div",
+        { class: "wrow" },
+        picker,
+        h("button", {
+          class: "btn ghost sm",
+          text: "Übernehmen",
+          disabled: this._busy ? "true" : null,
+          onclick: () => {
+            const next = this._pick["room:" + room.entity];
+            if (!next || next === room.entity) return;
+            this._retargetRoom(room, next);
+          },
+        })
+      ),
+      h("div", {
+        class: "muted sm",
+        text:
+          "Alle Zeitpläne dieses Raums steuern danach das gewählte Gerät. " +
+          "Zeiten, Tage und Fenster bleiben erhalten.",
+      }),
+      h(
+        "div",
+        { class: "wrow" },
+        h("button", {
+          class: "btn ghost sm danger",
+          text: "Raum entfernen",
+          disabled: this._busy ? "true" : null,
+          onclick: () => this._removeRoom(room),
+        }),
+        h("span", {
+          class: "muted sm",
+          text: "Löscht die " + room.schedules.length + " Zeitpläne dieses Raums.",
+        })
+      )
+    );
+  }
+
+  async _retargetRoom(room, next) {
+    if (this._busy) return;
+    this._busy = true;
+    this._render();
+    const sensors = this._windows(room);
+    const hadRule = !!this._ruleEntity(room);
+    try {
+      for (const s of room.schedules) {
+        this._target[s.schedule_id] = next;
+        await this._save(s, true);
+      }
+      if (hadRule) {
+        // the rule is keyed by thermostat, so move it across
+        await this._deleteRule(room.entity);
+        await this._writeRule(next, sensors);
+        await this._hass.callService("automation", "reload", {});
+      }
+    } catch (e) {
+      this._error = "Der Raum konnte nicht umgestellt werden: " + e.message;
+    }
+    this._target = {};
+    this._pick = {};
+    this._busy = false;
+    await this._reload();
+  }
+
+  async _removeRoom(room) {
+    if (this._busy) return;
+    this._busy = true;
+    this._render();
+    try {
+      if (this._ruleEntity(room)) {
+        await this._deleteRule(room.entity);
+        await this._hass.callService("automation", "reload", {});
+      }
+      for (const s of room.schedules)
+        await this._hass.callService("scheduler", "remove", {
+          entity_id: s.entity_id,
+        });
+    } catch (e) {
+      this._error = "Der Raum konnte nicht entfernt werden: " + e.message;
+    }
+    delete this._panel[room.entity];
+    delete this._roomPanel[room.entity];
+    this._busy = false;
+    await this._reload();
   }
 
   /** Assign window sensors to a room and decide what an open window does. */
@@ -959,16 +1130,13 @@ class HeatTimelineCard extends HTMLElement {
         })
       : [h("span", { class: "muted sm", text: "Noch kein Fenster zugeordnet." })];
 
-    const picker = h(
-      "select",
-      { class: "picker" },
-      h("option", { value: "", text: cand.length ? "Fenster wählen…" : "Keine weiteren Sensoren" }),
-      cand.map((c) =>
-        h("option", {
-          value: c.id,
-          text: c.name + (c.area ? " · " + c.area : "") + (c.same ? "  ✓" : ""),
-        })
-      )
+    const picker = this._select(
+      "win:" + room.entity,
+      cand.map((c) => ({
+        id: c.id,
+        label: c.name + (c.area ? " · " + c.area : "") + (c.same ? "  ✓" : ""),
+      })),
+      cand.length ? "Fenster wählen…" : "Keine weiteren Sensoren"
     );
 
     return h(
@@ -985,8 +1153,10 @@ class HeatTimelineCard extends HTMLElement {
           text: "Hinzufügen",
           disabled: cand.length ? null : "true",
           onclick: () => {
-            if (!picker.value) return;
-            this._setRoomWindows(room, sensors.concat([picker.value]));
+            const sel = this._pick["win:" + room.entity];
+            if (!sel) return;
+            this._pick["win:" + room.entity] = "";
+            this._setRoomWindows(room, sensors.concat([sel]));
           },
         })
       ),
@@ -1030,11 +1200,10 @@ class HeatTimelineCard extends HTMLElement {
       }))
       .sort((a, b) => a.name.localeCompare(b.name));
 
-    const picker = h(
-      "select",
-      { class: "picker" },
-      h("option", { value: "", text: cand.length ? "Thermostat wählen…" : "Kein weiteres Thermostat" }),
-      cand.map((c) => h("option", { value: c.id, text: c.name }))
+    const picker = this._select(
+      "newroom",
+      cand.map((c) => ({ id: c.id, label: c.name })),
+      cand.length ? "Thermostat wählen…" : "Kein weiteres Thermostat"
     );
 
     return h(
@@ -1049,7 +1218,12 @@ class HeatTimelineCard extends HTMLElement {
           class: "btn primary sm",
           text: "Anlegen",
           disabled: this._busy || !cand.length ? "true" : null,
-          onclick: () => picker.value && this._addRoom(picker.value),
+          onclick: () => {
+            const sel = this._pick.newroom;
+            if (!sel) return;
+            this._pick.newroom = "";
+            this._addRoom(sel);
+          },
         })
       ),
       h("div", {

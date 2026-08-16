@@ -36,6 +36,20 @@ bars and lets you drag them.
   you can see at a glance why a room is not heating.
 - **Start from nothing.** No schedules yet? Pick a thermostat under
   **Raum hinzufügen** and the card lays down a Mo–Fr and a Sa–So plan to edit.
+- **Edit the room itself.** **Raum** lets you point every schedule of a room at
+  a different thermostat — times, days and windows come along — or delete the
+  room and its schedules in one go.
+
+### New devices show up on their own
+
+Thermostats and window sensors are read from Home Assistant's live state, so a
+newly paired valve or window contact appears in the pickers as soon as Home
+Assistant knows about it. No reload, no restart.
+
+The card redraws only when something it displays has actually changed — a room's
+thermostat, one of its windows, a mode switch, or the set of entities itself.
+That matters: Home Assistant pushes *every* state change in the house, and
+redrawing on each one would reset an open picker several times a second.
 - **Now marker** on whichever row applies today.
 - **Nothing is written until you press Save.** Until then the card shows an
   "Ungespeichert" badge and a Discard button.
@@ -173,5 +187,13 @@ what makes the timeline unambiguous.
 
 There is no build step. `dist/heat-timeline-card.js` is the shipped artefact —
 a plain ES module with no dependencies. Edit it directly.
+
+The pure parts (schedule ↔ timeline conversion, weekday handling, condition
+merging, the redraw fingerprint) are exported and covered by tests that need
+nothing but node:
+
+```sh
+./test/run.sh
+```
 
 [scheduler]: https://github.com/nielsfaber/scheduler-component
